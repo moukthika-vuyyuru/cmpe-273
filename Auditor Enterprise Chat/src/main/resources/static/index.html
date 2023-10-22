@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deloitte Auditor Enterprise Chat UI</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #f4f4f4;
+        }
+        .chat-container {
+            background-color: #fff;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            width: 600px; /* Adjusted from 400px to 600px */
+            max-width: 100%;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        .chat-header {
+            background-color: #007bff;
+            color: #fff;
+            padding: 15px;
+            text-align: center;
+        }
+        .chat-content {
+            padding: 20px;
+        }
+        textarea, input[type=text] {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px; /* Larger text for easier reading */
+            box-sizing: border-box; /* Ensure padding doesn't add extra width */
+        }
+        textarea {
+            height: 150px; /* Set a fixed height */
+            resize: vertical; /* Allow the user to resize vertically */
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 15px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .send-btn {
+            background-color: #28a745;
+            color: white;
+        }
+        .cancel-btn {
+            background-color: #dc3545;
+            color: white;
+        }
+        button:hover {
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+
+<div class="chat-container">
+    <div class="chat-header">
+        Deloitte Auditor Enterprise Chat UI Deloitte
+    </div>
+    <div class="chat-content">
+        <label for="taxPrompt">Tax Prompt:</label>
+        <textarea id="taxPrompt" rows="4" placeholder="Enter your prompt..."></textarea> <!-- Changed from input to textarea -->
+
+        <div class="button-group">
+            <button class="send-btn" onclick="sendPrompt()">Send</button>
+            <button class="cancel-btn" onclick="cancelPrompt()">Cancel</button>
+        </div>
+
+        <label for="response">Response:</label>
+        <textarea id="response" rows="10" readonly></textarea> <!-- Increased size -->
+    </div>
+</div>
+
+<script>
+    async function sendPrompt() {
+        // Capture the user's question from the input field
+        var userPrompt = document.getElementById('taxPrompt').value;
+
+        // Prepare the data to send in JSON format
+        var data = { prompt: userPrompt };
+
+        // Send the request to your backend
+        try {
+            const response = await fetch('http://localhost:8080/api/ask', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data) // The data is a JSON object here
+            });
+
+            if (!response.ok) {
+                // If an error response
+                alert('Error: ' + response.status);
+                return;
+            }
+
+            // Get the response text
+            const message = await response.text();
+
+            // Display the response in your HTML
+            document.getElementById('response').value = message;
+        } catch (error) {
+            console.error('There was an error!', error);
+        }
+    }
+
+    function cancelPrompt() {
+        // Clear the input and response fields
+        document.getElementById('taxPrompt').value = '';
+        document.getElementById('response').value = '';
+    }
+</script>
+
+</body>
+</html>
