@@ -1,168 +1,267 @@
-import os
-import redis
+# -*- coding: utf-8 -*-
+
+# You might not need to install these via script, as they are usually installed once manually.
+# pip install redis pandas openai
 import openai
-import wikipedia
+import numpy as np
+import redis
+import os
+import wget
+import zipfile
+import pandas as pd
+from ast import literal_eval
+import ssl
 from redis.commands.search.field import TextField, VectorField
 from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+from redis.commands.search.query import Query
+import time
 
-from redis.commands.search.field import TextField, VectorField
-from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 
-def create_search_index(redis_client):
+# Constants
+INDEX_NAME = "embeddings-index"  # Name of the search index
+PREFIX = "doc"                   # Prefix for the document keys in Redis
+VECTOR_DIM = 300   
+
+#OPENAI_API_KEY = 
+openai.api_key = "sk-xxx"
+# Function to download Wikipedia data
+def download_wikipedia_data(data_path: str = './data/', download_path: str = "./",
+                            file_name: str = "vector_database_wikipedia_articles_embedded") -> pd.DataFrame:
+    data_url = 'https://cdn.openai.com/API/examples/data/vector_database_wikipedia_articles_embedded.zip'
+    csv_file_path = os.path.join(data_path, file_name + ".csv")
+    zip_file_path = os.path.join(download_path, file_name + ".zip")
+
+    ssl._create_default_https_context = ssl._create_unverified_context
+    wget.download(data_url, out=download_path)
+    if os.path.isfile(csv_file_path):
+        print("File already downloaded.")
+    else:
+        if not os.path.isfile(zip_file_path):
+            print("Downloading zip file...")
+            wget.download(data_url, out=download_path)
+        
+        print("Unzipping data...")
+        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+            zip_ref.extractall(data_path)
+
+        if os.path.exists(zip_file_path):
+            os.remove(zip_file_path)
+        print(f"Data downloaded and extracted to {data_path}")
+
+# Function to read Wikipedia data
+"""def read_wikipedia_data(data_path: str = './data/',
+                        file_name: str = "vector_database_wikipedia_articles_embedded",
+                        nrows: int = None) -> pd.DataFrame:
+    csv_file_path = os.path.join(data_path, file_name + ".csv")
+    data = pd.read_csv(csv_file_path, nrows=nrows)
+    data['title_vector'] = data['title_vector'].apply(literal_eval)
+    data['content_vector'] = data['content_vector'].apply(literal_eval)
+    data['vector_id'] = data['vector_id'].apply(str)
+    return data"""
+
+def read_wikipedia_data(data_path: str = './data/',
+                        file_name: str = "vector_database_wikipedia_articles_embedded") -> pd.DataFrame:
+    csv_file_path = os.path.join(data_path, file_name + ".csv")
+    data = pd.read_csv(csv_file_path)
+    data['title_vector'] = data['title_vector'].apply(literal_eval)
+    data['content_vector'] = data['content_vector'].apply(literal_eval)
+    data['vector_id'] = data['vector_id'].apply(str)
+    return data
+# Function to create a hybrid search field
+def create_hybrid_field(field_name: str, value: str) -> str:
+    return f'@{field_name}:"{value}"'
+
+# Function to run hybrid queries with Redis
+def search_redis(
+    redis_client: redis.Redis,
+    user_query: str,
+    index_name: str = "embeddings-index",
+    vector_field: str = "title_vector",
+    return_fields: list = ["title", "url", "text", "vector_score"],
+    hybrid_fields="*",
+    k: int = 20,
+    print_results: bool = True,
+) -> list[dict]:
+
+    # Creates embedding vector from user query using OpenAI
+    embedded_query = openai.Embedding.create(input=user_query,
+                                            model="text-embedding-ada-002",
+                                            )["data"][0]['embedding']
+
+    # Prepare the Query
+    base_query = f'{hybrid_fields}=>[KNN {k} @{vector_field} $vector AS vector_score]'
+    query = (
+        Query(base_query)
+         .return_fields(*return_fields)
+         .sort_by("vector_score")
+         .paging(0, k)
+         .dialect(2)
+    )
+    params_dict = {"vector": np.array(embedded_query).astype(dtype=np.float32).tobytes()}
+
+    # Perform vector search
+    results = redis_client.ft(index_name).search(query, params_dict)
+    if print_results:
+        for i, article in enumerate(results.docs):
+            score = 1 - float(article.vector_score)
+            print(f"{i}. {article.title} (Score: {round(score, 3)})")
+    return results.docs
+
+def create_search_index(redis_client, data):
+    print("Creating search index...")
+    VECTOR_DIM = len(data['title_vector'][0])  # Length of the vectors
+    VECTOR_NUMBER = len(data)                  # Initial number of vectors
+    INDEX_NAME = "embeddings-index"            # Name of the search index
+    PREFIX = "doc"                             # Prefix for the document keys
+    DISTANCE_METRIC = "COSINE"                 # Distance metric for the vectors
+
+    # Define RediSearch fields
+    title = TextField(name="title")
+    url = TextField(name="url")
+    text = TextField(name="text")
+    title_embedding = VectorField("title_vector", "FLAT", {
+        "TYPE": "FLOAT32",
+        "DIM": VECTOR_DIM,
+        "DISTANCE_METRIC": DISTANCE_METRIC,
+        "INITIAL_CAP": VECTOR_NUMBER,
+    })
+    text_embedding = VectorField("content_vector", "FLAT", {
+        "TYPE": "FLOAT32",
+        "DIM": VECTOR_DIM,
+        "DISTANCE_METRIC": DISTANCE_METRIC,
+        "INITIAL_CAP": VECTOR_NUMBER,
+    })
+    fields = [title, url, text, title_embedding, text_embedding]
+
+    # Create RediSearch Index
     try:
-        index_name = "wiki_index"
+        redis_client.ft(INDEX_NAME).info()
+        print("Index already exists")
+    except:
+        redis_client.ft(INDEX_NAME).create_index(
+            fields=fields,
+            definition=IndexDefinition(prefix=[PREFIX], index_type=IndexType.HASH)
+        )
+        print("Search index created")
+def index_documents(client: redis.Redis, prefix: str, documents: pd.DataFrame):
+    records = documents.to_dict("records")
+    indexed_count = 0  # Counter for successfully indexed documents
 
-        # Check if the index already exists
+    for doc in records:
+        key = f"{prefix}:{str(doc['vector_id'])}"
+        
+        # Convert embeddings to byte arrays
+        title_embedding = np.array(doc["title_vector"], dtype=np.float32).tobytes()
+        content_embedding = np.array(doc["content_vector"], dtype=np.float32).tobytes()
+
+        # Create a new dictionary for Redis, ensuring all data is in a compatible format
+        redis_doc = {
+            'url': str(doc['url']),
+            'title': str(doc['title']),
+            'text': str(doc['text']),
+            'title_vector': title_embedding,
+            'content_vector': content_embedding
+        }
+
         try:
-            if redis_client.ft(index_name).info():
-                print(f"Index '{index_name}' already exists.")
-                return index_name
-        except redis.exceptions.ResponseError:
-            # Index does not exist, proceed to create it
-            pass
+            client.hset(key, mapping=redis_doc)
+            indexed_count += 1
+        except Exception as e:
+            print(f"Failed to index document {key}: {e}")
 
-        vector_field = VectorField(
-            "embedding",
-            algorithm="FLAT",
-            attributes={
-                "TYPE": "FLOAT32",
-                "DIM": 128,
-                "DISTANCE_METRIC": "COSINE"
-            }
-        )
-        redis_client.ft(index_name).create_index(
-            fields=[TextField("title"), vector_field],
-            definition=IndexDefinition(prefix=['wiki:'], index_type=IndexType.HASH)
-        )
-        print(f"Search index '{index_name}' created.")
-        return index_name
-    except Exception as e:
-        print(f"Error creating/searching for search index: {e}")
-        return None
+    print(f"Indexed {indexed_count} documents out of {len(documents)}")
+
+def time_queries(redis_client, iterations: int = 10):
+    print(" ----- Flat Index ----- ")
+    t0 = time.time()
+    for i in range(iterations):
+        results_flat = search_redis(redis_client, 'modern art in Europe', k=10, print_results=False)
+    t0 = (time.time() - t0) / iterations
+    results_flat = search_redis(redis_client, 'modern art in Europe', k=10, print_results=True)
+    print(f"Flat index query time: {round(t0, 3)} seconds\n")
+    time.sleep(1)
+    print(" ----- HNSW Index ------ ")
+    t1 = time.time()
+    for i in range(iterations):
+        results_hnsw = search_redis(redis_client, 'modern art in Europe', index_name=HNSW_INDEX_NAME, k=10, print_results=False)
+    t1 = (time.time() - t1) / iterations
+    results_hnsw = search_redis(redis_client, 'modern art in Europe', index_name=HNSW_INDEX_NAME, k=10, print_results=True)
+    print(f"HNSW index query time: {round(t1, 3)} seconds")
+    print(" ------------------------ ")
 
 
-# Function to download Wikipedia summary
-def download_wikipedia_summary(title):
+
+def main():
+    # Local Redis Connection (change these settings as per your local Redis setup)
+    REDIS_HOST = "localhost"
+    REDIS_PORT = 6379
+    REDIS_PASSWORD = ""  # Add password here if needed
+
     try:
-        summary = wikipedia.summary(title)
-        print(f"Downloaded Wikipedia summary for {title}")
-        return summary
-    except Exception as e:
-        print(f"Error downloading Wikipedia summary for {title}: {e}")
-        return None
-
-# Function to connect to Redis
-def connect_to_redis():
-    try:
-        client = redis.Redis(host='localhost', port=6379, db=0)
-        client.ping()
-        print("Connected to Redis")
-        return client
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD)
+        print("Connection successful:", redis_client.ping())
     except Exception as e:
         print(f"Error connecting to Redis: {e}")
-        return None
-
-# Function to generate embeddings using OpenAI
-def generate_embedding(text):
-    try:
-        response = openai.Embedding.create(
-            input=[text],
-            model="text-similarity-babbage-001"
-        )
-        return response['data'][0]['embedding']
-    except Exception as e:
-        print(f"Error generating embedding: {e}")
-        return None
-
-# Modify the store_embedding function to accept the key argument
-def store_embedding(redis_client, key, embedding):
-    try:
-        redis_client.set(key, str(embedding))
-        print(f"Stored embedding for key: {key}")
-    except Exception as e:
-        print(f"Error storing embedding: {e}")
-
-# Function to retrieve embeddings from Redis
-def retrieve_embedding(redis_client, key):
-    try:
-        embedding = eval(redis_client.get(key))
-        print(f"Retrieved embedding for key: {key}")
-        return embedding
-    except Exception as e:
-        print(f"Error retrieving embedding: {e}")
-        return None
-    
-# Load document into the index
-def load_document(redis_client, index_name, title, embedding):
-    try:
-        doc_key = f"wiki:{title.replace(' ', '_')}"
-        redis_client.hset(doc_key, mapping={"title": title, "embedding": embedding})
-        print(f"Document for '{title}' loaded into index '{index_name}'.")
-    except Exception as e:
-        print(f"Error loading document into index: {e}")
-# Function to compute cosine similarity
-def cosine_similarity(vec_a, vec_b):
-    return 1 - distance.cosine(vec_a, vec_b)
-
-# Function to perform vector search
-def vector_search_query(redis_client, index_name, query_text):
-    try:
-        query_embedding = generate_embedding(query_text)
-        if query_embedding is None:
-            raise ValueError("Failed to generate embedding for the query.")
-
-        # Fetch all documents from the index (for demonstration; optimize for production use)
-        docs = redis_client.hgetall(index_name)
-        similar_docs = []
-        for key, doc_embedding_str in docs.items():
-            doc_embedding = np.array(eval(doc_embedding_str))
-            similarity = cosine_similarity(query_embedding, doc_embedding)
-            similar_docs.append((key, similarity))
-
-        # Sort documents by similarity
-        similar_docs.sort(key=lambda x: x[1], reverse=True)
-        return similar_docs
-    except Exception as e:
-        print(f"Error during vector search query: {e}")
-        return []
-def vector_search(redis_client, index_name, query):
-    query_embedding = generate_embedding(query)
-    if query_embedding is None:
-        raise ValueError("Failed to generate embedding for the query.")
-    return vector_search_query(redis_client, index_name, query)
-
-# Main execution
-def main():
-    # Set OpenAI API key
-    openai.api_key = "sk-"
-    if not openai.api_key:
-        raise ValueError("OpenAI API key is not set. Please set the OPENAI_API_KEY environment variable.")
-
-    # Connect to Redis
-    redis_client = connect_to_redis()
-    if not redis_client:
-        return
-    # Create a search index and get the index name
-    index_name = create_search_index(redis_client)
-    if not index_name:
         return
 
-    # List of topics to fetch summaries for
-    topics = ["Artificial Intelligence", "Data Science","Deep Learning"]
+    # Check if data file exists
+    data_file_path = './data/vector_database_wikipedia_articles_embedded.csv'
+    if not os.path.isfile(data_file_path):
+        # Download and read Wikipedia data if not already present
+        download_wikipedia_data()
+        data = read_wikipedia_data()
+    else:
+        # Load data from the existing file
+        data = read_wikipedia_data()
 
-    for topic in topics:
-        summary = download_wikipedia_summary(topic)
-        if summary:
-            embedding = generate_embedding(summary)
-            if embedding:
-                store_embedding(redis_client, f"wiki:{topic.replace(' ', '_')}", embedding)
+    print(data.head())
 
+    # Create search index in Redis
+    create_search_index(redis_client, data)
 
+    index_documents(redis_client, PREFIX, data)
+    # Print the number of documents loaded
+    db_info = redis_client.info('db0')
+    print(f"Loaded {db_info.get('keys', 0)} documents in Redis search index with name: {INDEX_NAME}")
 
-    # Example query
-    query_text = "Neural Networks"
-    similar_documents = vector_search(redis_client, index_name, query_text)
-    print("Similar Documents:", similar_documents)
+    # Run a hybrid query combining vector search with text search
+    text_query = "Famous battles in Scottish history"
+    hybrid_query_results = search_redis(
+        redis_client,
+        text_query,
+        vector_field="title_vector",
+        k=5,
+        hybrid_fields=create_hybrid_field("title", "Scottish")
+    )
+
+    # Print the results of the hybrid query
+    print("Hybrid Search Results 1:")
+    for i, article in enumerate(hybrid_query_results):
+        score = 1 - float(article.vector_score)
+        print(f"{i}. {article.title} (Score: {round(score, 3)})")
+
+    # Run another hybrid query
+    text_query = "Art"
+    hybrid_query_results = search_redis(
+        redis_client,
+        text_query,
+        vector_field="title_vector",
+        k=5,
+        hybrid_fields=create_hybrid_field("text", "Leonardo da Vinci")
+    )
+
+    # Print the results of the second hybrid query
+    print("Hybrid Search Results 2:")
+    for i, article in enumerate(hybrid_query_results):
+        score = 1 - float(article.vector_score)
+        print(f"{i}. {article.title} (Score: {round(score, 3)})")
+
+    # Find a specific mention of "Leonardo da Vinci" in the text returned by the second query
+    mention = [sentence for sentence in hybrid_query_results[0].text.split("\n") if "Leonardo da Vinci" in sentence][0]
+    print(f"Mention of 'Leonardo da Vinci': {mention}")
+
+    # Compare query performance between HNSW and FLAT indices
+    time_queries(redis_client)
 
 if __name__ == "__main__":
     main()
